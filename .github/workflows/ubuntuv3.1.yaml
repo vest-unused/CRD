@@ -1,0 +1,247 @@
+name: Linux Desktop via CRD
+
+on:
+  workflow_dispatch:
+    inputs:
+      gh_crd_auth:
+        description: "Auth Code CRD (dari remotedesktop.google.com/headless)"
+        required: true
+      gh_pc_name:
+        description: "Nama PC (tampil di aplikasi CRD)"
+        required: true
+        default: "RDP-Ubuntu"
+      gh_pin_crd:
+        description: "PIN (minimal 6 digit angka)"
+        required: true
+        default: "123321"
+      runtime_minutes:
+        description: "Durasi runtime dalam menit (maks 360; default 355)"
+        default: "355"
+      restore_mode:
+        description: "Pilih mode Firefox"
+        required: true
+        default: "restore"
+        type: choice
+        options:
+          - restore
+          - no-restore
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  crd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    steps:
+      - name: 🔧 Memproses input
+        id: cfg
+        run: |
+          # Validasi & normalisasi runtime
+          runtime=${{ inputs.runtime_minutes }}
+          if ! [[ "$runtime" =~ ^[0-9]+$ ]] || [ "$runtime" -gt 360 ] || [ "$runtime" -lt 6 ]; then
+            echo "Runtime tidak valid. Menggunakan default 355 menit."
+            runtime=355
+          fi
+
+          # Ambil raw input auth (bisa full DISPLAY=..., bisa hanya code)
+          raw="${{ inputs.gh_crd_auth }}"
+          raw="$(echo "$raw" | sed 's/\r$//')"  # buang CR kalau ada
+
+          echo "Raw gh_crd_auth:"
+          echo "$raw"
+
+          # Ekstrak --code="...." atau --code=....
+          code=""
+          if [[ "$raw" =~ --code=\"([^\"]+)\" ]]; then
+            code="${BASHREMATCH[1]}"
+          elif [[ "$raw" =~ --code=([^[:space:]]+) ]]; then
+            code="${BASH_REMATCH[1]}"
+            # buang quote kalau ada
+            code="${code%\"}"
+            code="${code#\"}"
+          else
+            # Asumsi user cuma isi pure code (4/0Ab3...)
+            code="$raw"
+          fi
+
+          echo "Resolved code: $code"
+          echo "Resolved runtime: $runtime"
+
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "pcname=${{ inputs.gh_pc_name }}" >> "$GITHUB_OUTPUT"
+          echo "pin=${{ inputs.gh_pin_crd }}" >> "$GITHUB_OUTPUT"
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+          echo "restore_mode=${{ inputs.restore_mode }}" >> "$GITHUB_OUTPUT"
+
+      - name: ♻ Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt
+          key: ${{ runner.os }}-apt-cache-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-cache-
+
+      - name: 📥 Instal Desktop + CRD + Browser
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --assume-yes --no-install-recommends \
+            xfce4 xfce4-terminal thunar desktop-base dbus-x11 xscreensaver wget curl unzip jq
+
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get -fy install
+
+          sudo apt-get install -y firefox
+          wget -q https://dl.google.com/linux/direct/chrome-remote-desktop_current_amd64.deb
+          sudo dpkg -i chrome-remote-desktop_current_amd64.deb || sudo apt-get -fy install
+
+      # === RESTORE PROFILE ===
+      - name: 🧩 Restore Profil Firefox
+        if: ${{ inputs.restore_mode == 'restore' }}
+        run: |
+          set -e
+          BACKUP_FILE="$HOME/ffprofile.zip"
+          SNAP_COMMON="/home/runner/snap/firefox/common/.mozilla/firefox"
+          SNAP_CURRENT="/home/runner/snap/firefox/current/.mozilla/firefox"
+          mkdir -p "$SNAP_COMMON" "$SNAP_CURRENT"
+
+          echo "📥 Mengunduh file backup profil..."
+          wget -q -O "$BACKUP_FILE" "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffpu/ffprofile.zip" || true
+          if [ -s "$BACKUP_FILE" ]; then
+            unzip -oq "$BACKUP_FILE" -d "$SNAP_COMMON"
+            cp "$SNAP_COMMON/profiles.ini" "$SNAP_CURRENT/profiles.ini" || true
+            cp -rT "$SNAP_COMMON/default-release" "$SNAP_CURRENT/default-release" || true
+            chmod -R 777 /home/runner/snap/firefox || true
+            echo "✅ Restore profil selesai."
+          else
+            echo "⚠️ File backup tidak ditemukan, skip restore."
+          fi
+
+      - name: 🚀 Konfigurasi Chrome Remote Desktop
+        run: |
+          export MOZ_LEGACY_PROFILES=1
+          export MOZ_ALLOW_DOWNGRADE=1
+
+          code="${{ steps.cfg.outputs.code }}"
+          pcname="${{ steps.cfg.outputs.pcname }}"
+          pin="${{ steps.cfg.outputs.pin }}"
+
+          echo "Menggunakan CODE: $code"
+          echo "Nama PC: $pcname"
+
+          DISPLAY= /opt/google/chrome-remote-desktop/start-host \
+            --code="$code" \
+            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" \
+            --name="$pcname" \
+            --pin="$pin"
+
+      # === INSTALL EXTENSIONS - RESTORE MODE ===
+      - name: 🌐 Instal Extension Firefox & Chrome (Mode Restore)
+        if: ${{ inputs.restore_mode == 'restore' }}
+        run: |
+          echo "=== Instal Extension Firefox (Restore Mode) ==="
+          PF_CURRENT=$(find /home/runner/snap/firefox/current/.mozilla/firefox -maxdepth 1 -type d -name "*.default-release" | head -n 1 || true)
+          PF_COMMON="/home/runner/snap/firefox/common/.mozilla/firefox/default-release"
+          FIREFOX_PROFILE_PATH="${PF_CURRENT:-$PF_COMMON}"
+          mkdir -p "$FIREFOX_PROFILE_PATH/extensions"
+
+          wget -O ~/ublock_origin.xpi "https://addons.mozilla.org/firefox/downloads/file/4578681/ublock_origin-1.66.4.xpi"
+          wget -O ~/xdm_browser_monitor.xpi "https://addons.mozilla.org/firefox/downloads/file/3710348/xdm_browser_monitor-2.2.xpi"
+          wget -O ~/multi_account_containers.xpi "https://addons.mozilla.org/firefox/downloads/file/4494279/multi_account_containers-8.3.0.xpi"
+          wget -O ~/twitter_media_harvest.xpi "https://github.com/EltonChou/TwitterMediaHarvest/releases/download/v4.4.4/mediaharvest@mediaharvest.app-v4.4.4.xpi"
+
+          EXT_DIR="$FIREFOX_PROFILE_PATH/extensions"
+          for xpi in ~/ublock_origin.xpi ~/xdm_browser_monitor.xpi ~/multi_account_containers.xpi ~/twitter_media_harvest.xpi; do
+            tmpdir=$(mktemp -d)
+            unzip -qq "$xpi" -d "$tmpdir"
+            id=$(jq -r '.applications.gecko.id // .browser_specific_settings.gecko.id' "$tmpdir/manifest.json")
+            [ -n "$id" ] && cp "$xpi" "$EXT_DIR/$id.xpi"
+          done
+          echo "✅ Ekstensi Firefox mode restore terpasang."
+
+      # === INSTALL EXTENSIONS - NO RESTORE MODE ===
+      - name: 🌐 Instal Extension Firefox & Chrome (Mode No-Restore)
+        if: ${{ inputs.restore_mode == 'no-restore' }}
+        run: |
+          echo "=== Instal Extension Firefox (No-Restore Mode) ==="
+          sudo apt-get install -y jq unzip
+
+          FIREFOX_PROFILE_NAME="default-release"
+          FIREFOX_PROFILE_PATH="$HOME/.mozilla/firefox/${FIREFOX_PROFILE_NAME}"
+          mkdir -p "$FIREFOX_PROFILE_PATH"
+
+          cat <<EOF > "$HOME/.mozilla/firefox/profiles.ini"
+          [General]
+          StartWithLastProfile=1
+          [Profile0]
+          Name=$FIREFOX_PROFILE_NAME
+          IsRelative=1
+          Path=${FIREFOX_PROFILE_NAME}
+          Default=1
+          EOF
+
+          wget -O ~/ublock_origin.xpi "https://addons.mozilla.org/firefox/downloads/file/4578681/ublock_origin-1.66.4.xpi"
+          wget -O ~/xdm_browser_monitor.xpi "https://addons.mozilla.org/firefox/downloads/file/3710348/xdm_browser_monitor-2.2.xpi"
+          wget -O ~/multi_account_containers.xpi "https://addons.mozilla.org/firefox/downloads/file/4494279/multi_account_containers-8.3.0.xpi"
+          wget -O ~/twitter_media_harvest.xpi "https://github.com/EltonChou/TwitterMediaHarvest/releases/download/v4.4.4/mediaharvest@mediaharvest.app-v4.4.4.xpi"
+
+          EXT_DIR="$FIREFOX_PROFILE_PATH/extensions"
+          mkdir -p "$EXT_DIR"
+
+          for xpi in ~/ublock_origin.xpi ~/xdm_browser_monitor.xpi ~/multi_account_containers.xpi ~/twitter_media_harvest.xpi; do
+            tmpdir=$(mktemp -d)
+            unzip -qq "$xpi" -d "$tmpdir"
+            id=$(jq -r '.applications.gecko.id // .browser_specific_settings.gecko.id' "$tmpdir/manifest.json")
+            [ -n "$id" ] && cp "$xpi" "$EXT_DIR/$id.xpi"
+          done
+
+          cat <<EOF > "$FIREFOX_PROFILE_PATH/prefs.js"
+          user_pref("xpinstall.signatures.required", false);
+          user_pref("extensions.autoDisableScopes", 0);
+          user_pref("extensions.enabledScopes", 15);
+          user_pref("browser.startup.homepage", "https://www.google.com/");
+          EOF
+
+          echo "✅ Semua ekstensi Firefox (No-Restore) aktif."
+          echo "=== Instal Extension Chrome ==="
+          mkdir -p ~/.config/google-chrome/Default
+          sudo mkdir -p /etc/opt/chrome/policies/managed
+          cat <<EOF | sudo tee /etc/opt/chrome/policies/managed/extensions.json
+          {
+            "ExtensionInstallForcelist": [
+              "ddkjiahejlhfcafbddmgiahcphecmpfh;https://clients2.google.com/service/update2/crx",
+              "jonfefokggbliacanjbaiejmbclccocp;https://clients2.google.com/service/update2/crx"
+            ]
+          }
+          EOF
+
+      - name: 📥 Download passwords CSV ke ~/Downloads/pass.csv
+        run: |
+          mkdir -p "$HOME/Downloads"
+          CSV_URL="https://drive.google.com/uc?export=download&id=1DigM_oDo5EZl9yDJzVqiefyOulHr-LMt"
+          OUT="$HOME/Downloads/pass.csv"
+          wget -q -O "$OUT" "$CSV_URL"
+          [ -s "$OUT" ] && chmod 600 "$OUT" && echo "✅ File CSV tersimpan di $OUT"
+
+      - name: 📦 Instal Aplikasi Tambahan (XDM, FFmpeg, YT-DLP, MEGA)
+        run: |
+          echo "=== Instal XDM ==="
+          wget -O xdm-setup-7.2.11.tar.xz https://github.com/subhra74/xdm/releases/download/7.2.11/xdm-setup-7.2.11.tar.xz
+          tar -xvf xdm-setup-7.2.11.tar.xz && sudo ./install.sh
+          echo "=== Instal FFmpeg & YT-DLP ==="
+          sudo apt-get install -y ffmpeg python3 python3-pip jq unzip && python3 -m pip install -U yt-dlp
+
+      - name: ⏳ Menjaga sesi tetap aktif
+        run: |
+          runtime_mins="${{ steps.cfg.outputs.runtime }}"
+          end_time=$((SECONDS + runtime_mins * 60))
+          while [ $SECONDS -lt $end_time ]; do
+            remaining=$(( (end_time - SECONDS) / 60 ))
+            echo "⏳ Sesi aktif, sisa $remaining menit..."
+            sleep 60
+          done
+          echo "✅ Sesi selesai."

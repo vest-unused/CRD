@@ -1,0 +1,673 @@
+name: RDP CS Windows Via CRD NEW
+
+on:
+  workflow_dispatch:
+    inputs:
+      gh_crd_auth:
+        description: "Auth Code CRD (from remotedesktop.google.com/headless)"
+        required: true
+      gh_pc_name:
+        description: "PC Name (displayed in CRD)"
+        required: true
+        default: "RDP-SE"
+      mode_restore:
+        description: "Pilih mode restore (minimum / full)"
+        required: true
+        default: "minimum"
+        type: choice
+        options:
+          - minimum
+          - full
+      gh_pin_crd:
+        description: "PIN (min 6 digits)"
+        required: true
+        default: "123321"
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; default 355)"
+        default: "400"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: mycrd
+  RDP_PASS: MySecurePass123
+
+jobs:
+  crd:
+    runs-on: windows-2022
+    timeout-minutes: 370
+    steps:
+      - name: 🔧 Resolve inputs
+        id: cfg
+        run: |
+          function ToIntOr($v, $def){ if("$v" -match '^\d+$'){[int]$v}else{[int]$def} }
+
+          $runtime = ToIntOr "${{ inputs.runtime_minutes }}" 355
+          if ($runtime -gt 360) { $runtime = 355 }
+          if ($runtime -lt 6) { $runtime = 355 }
+
+          # Ambil raw input dari gh_crd_auth SEBAGAI TEKS MENTAH (boleh full command DISPLAY= ...)
+          $rawAuth = @'
+          ${{ inputs.gh_crd_auth }}
+          '@
+          $rawAuth = $rawAuth.Trim()
+
+          Write-Host "Raw auth input:"
+          Write-Host $rawAuth
+
+          # Coba extract pattern --code="...."
+          if ($rawAuth -match '--code="([^"]+)"') {
+            $code = $matches[1]
+          }
+          # Kalau formatnya code=xxxx tanpa tanda kutip (misalnya dari CRD lama)
+          elseif ($rawAuth -match 'code=([^ ]+)') {
+            $code = $matches[1].Trim('"')
+          }
+          # Kalau user hanya isi pure code (4/0Ab3...)
+          else {
+            $code = $rawAuth.Trim()
+          }
+
+          "code=$code"                    | Out-File -Append $env:GITHUB_OUTPUT
+          "pcname=${{ inputs.gh_pc_name }}" | Out-File -Append $env:GITHUB_OUTPUT
+          "pin=${{ inputs.gh_pin_crd }}"    | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime"                | Out-File -Append $env:GITHUB_OUTPUT
+
+          Write-Host "Resolved runtime=$runtime"
+          Write-Host "Resolved code=$code"
+
+      - name: 🔐 Enable RDP user (optional, for local access)
+        run: |
+          $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: 📥 Download & Install Chrome Remote Desktop Host
+        run: |
+          $crdUrl = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
+          $crdMsi = "$env:TEMP\crdhost.msi"
+          Invoke-WebRequest -Uri $crdUrl -OutFile $crdMsi -UseBasicParsing
+          Start-Process "msiexec.exe" -ArgumentList "/i `"$crdMsi`" /quiet /norestart" -Wait
+
+      - name: 🚀 Setup Chrome Remote Desktop
+        run: |
+          $crdPath = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $crdPath)) {
+            Write-Error "CRD not installed!"; exit 1
+          }
+
+          $code   = "${{ steps.cfg.outputs.code }}"
+          $pcname = "${{ steps.cfg.outputs.pcname }}"
+          $pin    = "${{ steps.cfg.outputs.pin }}"
+
+          if ($pin.Length -lt 6 -or ($pin -notmatch '^\d+$')) {
+            Write-Error "PIN must be at least 6 digits (numbers only)."; exit 1
+          }
+
+          & $crdPath `
+            --code="$code" `
+            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
+            --display-name="$pcname" `
+            --pin="$pin"
+
+      - name: 🎬 Install Subtitle Edit
+        if: ${{ inputs.mode_restore == 'minimum' }}
+        run: |
+          Write-Host "Downloading and installing Subtitle Edit..."
+          $url = "https://github.com/SubtitleEdit/subtitleedit/releases/download/4.0.14/SubtitleEdit-4.0.14-Setup.exe"
+          $installer = "$env:TEMP\SubtitleEdit-Setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          Write-Host "Running installer silently..."
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /NORESTART /SP-" -Wait
+          Write-Host "Subtitle Edit installed successfully."
+
+      - name: 🎬 Install VirtualBox
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "Downloading and installing VirtualBox..."
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/vb/VirtualBox-7.2.6a-172322-Win.exe"
+          $installer = "$env:TEMP\VirtualBox-7.2.6a-172322-Win.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          Write-Host "Running installer silently..."
+          Start-Process -FilePath $installer -ArgumentList "--silent" -Wait
+          Write-Host "VirtualBox installation finished."
+
+      - name: 📥 Download auto-send-email.zip (khusus mode minimum)
+        if: ${{ inputs.mode_restore == 'minimum' }}
+        run: |
+          Write-Host "Downloading auto-send-email.zip to Downloads folder (mode minimum)..."
+          $downloadFolder = "$env:USERPROFILE\Downloads"
+          if (!(Test-Path $downloadFolder)) {
+            New-Item -ItemType Directory -Path $downloadFolder | Out-Null
+          }
+
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ase/auto-send-email.zip"
+          $output = "$downloadFolder\auto-send-email.zip"
+          Invoke-WebRequest -Uri $url -OutFile $output -UseBasicParsing
+          Write-Host "✅ File saved: $output"
+
+          $size = (Get-Item $output).Length
+          Write-Host "File size: $size bytes"
+
+      - name: 🧩 Extract auto-send-email.zip langsung ke Downloads (khusus mode minimum)
+        if: ${{ inputs.mode_restore == 'minimum' }}
+        run: |
+          Write-Host "=== Mengekstrak auto-send-email.zip langsung ke Downloads (mode minimum) ==="
+
+          $zipPath = "$env:USERPROFILE\Downloads\auto-send-email.zip"
+          $extractPath = "$env:USERPROFILE\Downloads"  # langsung ke Downloads
+
+          # Pastikan file ZIP sudah ada
+          if (!(Test-Path $zipPath)) {
+            Write-Host "❌ File auto-send-email.zip tidak ditemukan: $zipPath"
+            exit 1
+          }
+
+          Write-Host "📦 Mengekstrak ke: $extractPath"
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+          Write-Host "✅ Extract selesai, semua file auto-send-email sekarang ada di folder Downloads."
+
+      - name: 📥 Download setup-wdown.zip (khusus mode full)
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "Downloading setup-wdown.zip to Downloads folder (mode full)..."
+          $downloadFolder = "$env:USERPROFILE\Downloads"
+          if (!(Test-Path $downloadFolder)) {
+            New-Item -ItemType Directory -Path $downloadFolder | Out-Null
+          }
+
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/wdown/setup-wdown.zip"
+          $output = "$downloadFolder\setup-wdown.zip"
+          Invoke-WebRequest -Uri $url -OutFile $output -UseBasicParsing
+          Write-Host "✅ File saved: $output"
+
+          $size = (Get-Item $output).Length
+          Write-Host "File size: $size bytes"
+
+      - name: 🧩 Extract setup-wdown.zip ke folder Downloads (khusus mode full)
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "=== Mode full terdeteksi, mengekstrak setup-wdown.zip ==="
+
+          $zipPath = "$env:USERPROFILE\Downloads\setup-wdown.zip"
+          $extractPath = "D:\setup-wdown"
+
+          # Pastikan file ZIP tersedia
+          if (!(Test-Path $zipPath)) {
+            Write-Host "❌ File setup-wdown.zip tidak ditemukan: $zipPath"
+            exit 1
+          }
+
+          # Hapus folder lama jika sudah ada
+          if (Test-Path $extractPath) {
+            Remove-Item -Recurse -Force $extractPath
+            Write-Host "🧹 Folder lama dihapus: $extractPath"
+          }
+
+          # Ekstrak ZIP langsung ke folder Downloads
+          Write-Host "📦 Mengekstrak ke: $extractPath"
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+          Write-Host "✅ setup-wdown.zip berhasil diekstrak ke $extractPath"
+
+      - name: 📦 Download VM CasaOS
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "=== Mode full terdeteksi, memulai download VM CasaOS multipart ZIP ==="
+
+          $downloadFolder = "$env:USERPROFILE\Downloads"
+          $url1 = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/cs/setup-stream.zip.001"
+          $url2 = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/cs/setup-stream.zip.002"
+
+          if (!(Test-Path $downloadFolder)) {
+          New-Item -ItemType Directory -Path $downloadFolder | Out-Null
+          }
+
+          function Download-WithRetry {
+          param($url, $out)
+
+          $maxRetry = 3
+          for ($i=1; $i -le $maxRetry; $i++) {
+            try {
+                Write-Host "Downloading $url (attempt $i)"
+                Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+                return
+            } catch {
+                if ($i -eq $maxRetry) { throw }
+                Write-Host "Retrying download..."
+                Start-Sleep -Seconds 3
+            }
+           }
+          }
+
+          Write-Host "=== Memulai download paralel ==="
+
+          $job1 = Start-Job { 
+          param($u,$o) 
+          Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing 
+          } -ArgumentList $url1,"$downloadFolder\CasaOS.zip.001"
+
+          $job2 = Start-Job { 
+          param($u,$o) 
+          Invoke-WebRequest -Uri $u -OutFile $o -UseBasicParsing 
+          } -ArgumentList $url2,"$downloadFolder\CasaOS.zip.002"
+
+          Wait-Job $job1,$job2
+          Receive-Job $job1,$job2
+
+          Write-Host "✅ Semua part berhasil didownload"
+
+          Write-Host "=== Mengekstrak CasaOS multipart ZIP ==="
+
+          $extractPath = "$env:TEMP\CasaOSExtract"
+          if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
+          New-Item -ItemType Directory -Path $extractPath | Out-Null
+
+          & 7z x "$downloadFolder\CasaOS.zip.001" -o"$extractPath" -y | Out-Null
+
+          $dest = "D:\setup-stream"
+
+          Write-Host "=== Memindahkan hasil ekstraksi ke $dest ==="
+
+          if (!(Test-Path $dest)) {
+          New-Item -ItemType Directory -Path $dest | Out-Null
+          }
+
+          Copy-Item -Path "$extractPath\*" -Destination $dest -Recurse -Force
+
+          Write-Host "✅ CasaOS berhasil didownload, diekstrak, dan dipindahkan ke setup-stream."
+
+      - name: Setup FFmpeg Manual
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "=== Download FFmpeg ==="
+          Invoke-WebRequest -Uri "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/fmp/ffmpeg.zip" -OutFile "ffmpeg.zip" -UseBasicParsing
+
+          Write-Host "=== Extract ke C:\ ==="
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "C:\" -Force
+
+          Write-Host "=== Set PATH ==="
+          $toolPath = "C:\ffmpeg\bin"
+          $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+          if ($currentPath -notlike "*$toolPath*") {
+            [Environment]::SetEnvironmentVariable("PATH", "$toolPath;$currentPath", "Machine")
+          }
+          $env:PATH = "$toolPath;$env:PATH"
+          Write-Host "ffmpeg version: $(ffmpeg -version 2>&1 | Select-Object -First 1)"
+
+      - name: Setup gallery-dl Manual
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "=== Download gallery-dl ==="
+          Invoke-WebRequest -Uri "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/gldl/gallery-dl.zip" -OutFile "gallery-dl.zip" -UseBasicParsing
+
+          Write-Host "=== Extract ke C:\ ==="
+          Expand-Archive -Path "gallery-dl.zip" -DestinationPath "C:\" -Force
+
+          Write-Host "=== Set PATH ==="
+          $toolPath = "C:\gallery-dl"
+          $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+          if ($currentPath -notlike "*$toolPath*") {
+            [Environment]::SetEnvironmentVariable("PATH", "$toolPath;$currentPath", "Machine")
+          }
+          $env:PATH = "$toolPath;$env:PATH"
+          Write-Host "gallery-dl version: $(gallery-dl --version 2>&1)"
+
+      - name: Setup rclone Manual
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "=== Download rclone ==="
+          Invoke-WebRequest -Uri "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/rcln/rclone.zip" -OutFile "rclone.zip" -UseBasicParsing
+
+          Write-Host "=== Extract ke C:\ ==="
+          Expand-Archive -Path "rclone.zip" -DestinationPath "C:\" -Force
+
+          Write-Host "=== Set PATH ==="
+          $toolPath = "C:\rclone"
+          $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+          if ($currentPath -notlike "*$toolPath*") {
+            [Environment]::SetEnvironmentVariable("PATH", "$toolPath;$currentPath", "Machine")
+          }
+          $env:PATH = "$toolPath;$env:PATH"
+          Write-Host "rclone version: $(rclone --version 2>&1 | Select-Object -First 1)"
+
+      - name: 🔹 Download ffprofile.zip dari Google Drive (berdasarkan mode)
+        run: |
+          Write-Host "=== Menentukan link download berdasarkan mode restore ==="
+          $mode = "${{ github.event.inputs.mode_restore }}"
+          Write-Host "Mode restore dipilih: $mode"
+
+          if ($mode -eq "minimum") {
+              $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffp-min/ffprofile.zip"
+              Write-Host "Mode minimum: menggunakan link minimum restore"
+          } elseif ($mode -eq "full") {
+              $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffp-full/ffprofile.zip"
+              Write-Host "Mode full: menggunakan link full restore"
+          } else {
+              Write-Host "Mode tidak dikenal, default ke full restore"
+              $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/ffp-min/ffprofile.zip"
+          }
+
+          $output = "$env:USERPROFILE\Downloads\ffprofile.zip"
+          Write-Host "Mengunduh dari: $url"
+          Invoke-WebRequest -Uri $url -OutFile $output
+          Write-Host "Download selesai: $output"
+
+      - name: 🔹 Ekstrak ZIP ke folder sementara
+        run: |
+          Write-Host "=== Mengekstrak file ZIP ==="
+          $zipPath = "$env:USERPROFILE\Downloads\ffprofile.zip"
+          $extractPath = "$env:USERPROFILE\Downloads\ffprofile"
+          if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath
+          Write-Host "Extract selesai ke: $extractPath"
+
+      - name: 🧩 Download & Extract Subtitle Edit (khusus mode minimum)
+        if: ${{ inputs.mode_restore == 'minimum' }}
+        run: |
+          Write-Host "=== Mode minimum terdeteksi, memulai download Subtitle Edit multipart ZIP ==="
+
+          $urlBase = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/sedata"
+          $downloadFolder = "$env:USERPROFILE\Downloads"
+
+          # Pastikan folder download ada
+          if (!(Test-Path $downloadFolder)) {
+            New-Item -ItemType Directory -Path $downloadFolder | Out-Null
+          }
+
+          # Download semua part
+          Write-Host "Mengunduh Subtitle.Edit.zip.001 ..."
+          Invoke-WebRequest -Uri "$urlBase/Subtitle.Edit.zip.001" -OutFile "$downloadFolder\Subtitle.Edit.zip.001" -UseBasicParsing
+          Write-Host "Mengunduh Subtitle.Edit.zip.002 ..."
+          Invoke-WebRequest -Uri "$urlBase/Subtitle.Edit.zip.002" -OutFile "$downloadFolder\Subtitle.Edit.zip.002" -UseBasicParsing
+          Write-Host "Mengunduh Subtitle.Edit.zip.003 ..."
+          Invoke-WebRequest -Uri "$urlBase/Subtitle.Edit.zip.003" -OutFile "$downloadFolder\Subtitle.Edit.zip.003" -UseBasicParsing
+
+          # Ekstrak menggunakan 7-Zip
+          Write-Host "=== Mengekstrak Subtitle Edit multipart ZIP ==="
+          $extractPath = "$env:TEMP\SubtitleEditExtract"
+          if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
+          New-Item -ItemType Directory -Path $extractPath | Out-Null
+
+          # Gunakan 7z bawaan runner Windows
+          & 7z x "$downloadFolder\Subtitle.Edit.zip.001" -o"$extractPath" -y | Out-Null
+
+          # Pindahkan hasil ekstraksi ke AppData\Roaming
+          $dest = "C:\Users\runneradmin\AppData\Roaming"
+          Write-Host "=== Memindahkan hasil ekstraksi ke $dest ==="
+
+          if (!(Test-Path $dest)) {
+            New-Item -ItemType Directory -Path $dest | Out-Null
+          }
+
+          Copy-Item -Path "$extractPath\*" -Destination $dest -Recurse -Force
+          Write-Host "✅ Subtitle Edit multipart ZIP berhasil diekstrak dan dipindahkan."
+
+      - name: 🔹 Pindahkan hasil extract ke folder Firefox Roaming
+        run: |
+          Write-Host "=== Menyalin ke folder Firefox Roaming ==="
+          $source = "$env:USERPROFILE\Downloads\ffprofile\*"
+          $dest = "C:\Users\runneradmin\AppData\Roaming\Mozilla\Firefox"
+
+          # Buat folder jika belum ada
+          if (!(Test-Path $dest)) {
+              New-Item -ItemType Directory -Force -Path $dest | Out-Null
+              Write-Host "Folder Firefox dibuat: $dest"
+          }
+
+          # Salin dan timpa file
+          Copy-Item -Path $source -Destination $dest -Recurse -Force
+          Write-Host "Semua file berhasil disalin dan ditimpa jika sudah ada."
+
+      - name: 🧹 Hapus file ZIP sesuai mode restore
+        run: |
+          Write-Host "=== Membersihkan file ZIP berdasarkan mode restore ==="
+          $mode = "${{ inputs.mode_restore }}"
+          Write-Host "Mode restore saat ini: $mode"
+
+          # Tentukan daftar file ZIP
+          $baseFiles = @(
+            "$env:USERPROFILE\Downloads\ffprofile.zip",
+            "$env:USERPROFILE\Downloads\chprofile.zip",
+            "$env:USERPROFILE\Downloads\Subtitle.Edit.zip.001",
+            "$env:USERPROFILE\Downloads\Subtitle.Edit.zip.002",
+            "$env:USERPROFILE\Downloads\Subtitle.Edit.zip.003"
+          )
+
+          $autoSend = "$env:USERPROFILE\Downloads\auto-send-email.zip"
+          $wdown    = "$env:USERPROFILE\Downloads\setup-wdown.zip"
+
+          # Tentukan file yang akan dihapus berdasarkan mode
+          if ($mode -eq "full") {
+            Write-Host "🧩 Mode full → auto-send-email.zip dipertahankan."
+            $deleteFiles = $baseFiles + @(
+              "$env:USERPROFILE\Downloads\CasaOS.zip.001",
+              "$env:USERPROFILE\Downloads\CasaOS.zip.002",
+              $wdown
+            )
+          } elseif ($mode -eq "minimum") {
+            Write-Host "🧩 Mode minimum → setup-wdown.zip dipertahankan."
+            $deleteFiles = $baseFiles + $autoSend
+          } else {
+            Write-Host "⚠️ Mode tidak dikenal, hapus semua ZIP kecuali auto-send-email.zip & setup-wdown.zip."
+            $deleteFiles = $baseFiles
+          }
+
+          # Jalankan penghapusan aman
+          foreach ($file in $deleteFiles) {
+            if (Test-Path $file) {
+              try {
+                Remove-Item -Force $file
+                Write-Host "🗑️ Dihapus: $file"
+              } catch {
+                Write-Host "⚠️ Gagal hapus $file - $_"
+              }
+            } else {
+              Write-Host "ℹ️ Tidak ditemukan: $file"
+            }
+          }
+
+          # ====== Hapus folder ffprofile di semua mode ======
+          $ffprofileFolder = "$env:USERPROFILE\Downloads\ffprofile"
+          if (Test-Path $ffprofileFolder) {
+            try {
+              Remove-Item -Recurse -Force $ffprofileFolder
+              Write-Host "🗑️ Folder ffprofile dihapus: $ffprofileFolder"
+            } catch {
+              Write-Host "⚠️ Gagal hapus folder ffprofile - $_"
+            }
+          } else {
+            Write-Host "ℹ️ Folder ffprofile tidak ditemukan, dilewati."
+          }
+
+          # ====== Hapus folder chprofile di semua mode ======
+          $chprofileFolder = "$env:USERPROFILE\Downloads\chprofile"
+          if (Test-Path $chprofileFolder) {
+            try {
+              Remove-Item -Recurse -Force $chprofileFolder
+              Write-Host "🗑️ Folder chprofile dihapus: $chprofileFolder"
+            } catch {
+              Write-Host "⚠️ Gagal hapus folder chprofile - $_"
+            }
+          } else {
+            Write-Host "ℹ️ Folder chprofile tidak ditemukan, dilewati."
+          }
+
+          Write-Host "✅ Proses pembersihan file ZIP selesai."
+
+      - name: 🧩 Install Bulk Rename Utility (BRU)
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "=== Mengunduh dan menginstal Bulk Rename Utility ==="
+          $url = "https://github.com/Thorns2007/super-duper-computing-machine/releases/download/bru/BRU_setup_4.1.0.0.exe"
+          $installer = "$env:TEMP\BRU_setup.exe"
+
+          # Unduh installer
+          Write-Host "⬇️ Mengunduh BRU installer..."
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+          if (!(Test-Path $installer)) {
+            Write-Host "❌ Gagal mengunduh file: $url"
+            exit 1
+          }
+
+          # Jalankan instalasi silent
+          Write-Host "⚙️ Menjalankan instalasi Bulk Rename Utility..."
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /NORESTART /SP-" -Wait
+
+          # Verifikasi instalasi
+          $bruPath = "C:\Program Files\Bulk Rename Utility\Bulk Rename Utility.exe"
+          if (Test-Path $bruPath) {
+            Write-Host "✅ Bulk Rename Utility berhasil diinstal di: $bruPath"
+          } else {
+            Write-Host "⚠️ Tidak ditemukan file eksekusi BRU. Periksa instalasi manual."
+          }
+
+      - name: 📁 Create folders & pin to Quick Access
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Write-Host "=== Membuat folder dan pin ke Quick Access ==="
+
+          $userRoot = $env:USERPROFILE
+
+          # Definisi path folder
+          $videoFolder    = Join-Path $userRoot "Downloads\Video"
+          $twitterFolder  = Join-Path $userRoot "Downloads\twitter_media_harvest"
+          $mumuDownload   = Join-Path $userRoot "Documents\MuMuSharedFolder\Download"
+          $wdownFolder    = "D:\setup-wdown"
+
+          $folders = @(
+            $videoFolder,
+            $twitterFolder,
+            $mumuDownload,
+            $wdownFolder
+          )
+
+          # Buat semua folder kalau belum ada
+          foreach ($f in $folders) {
+            if (!(Test-Path $f)) {
+              New-Item -ItemType Directory -Path $f -Force | Out-Null
+              Write-Host "📁 Folder dibuat: $f"
+            } else {
+              Write-Host "ℹ Folder sudah ada: $f"
+            }
+          }
+
+          # COM Shell untuk operasi Quick Access
+          $shell = New-Object -ComObject Shell.Application
+
+          function Reset-QuickAccessPin {
+            param(
+              [string]$Path,
+              [string]$Label
+            )
+
+            Write-Host "=== Proses pin untuk: $Label ($Path) ==="
+
+            $folder = $shell.Namespace($Path)
+            if (-not $folder) {
+              Write-Host "❌ Folder tidak ditemukan: $Path"
+              return
+            }
+
+            $item = $folder.Self
+
+            # Coba unpin dulu (kalau belum pinned, ini biasanya cuma error kecil, diabaikan)
+            try {
+              $item.InvokeVerb("unpinfromhome") | Out-Null
+              Write-Host "🔓 Unpin sebelumnya (jika ada)."
+            } catch {
+              Write-Host "ℹ Tidak ada pin sebelumnya atau unpin gagal (bisa diabaikan)."
+            }
+
+            Start-Sleep -Milliseconds 200
+
+            # Pin ulang
+            try {
+              $item.InvokeVerb("pintohome") | Out-Null
+              Write-Host "📌 Berhasil di-pin ke Quick Access: $Label"
+            } catch {
+              Write-Host "⚠ Gagal pin ke Quick Access: $Label - $_"
+            }
+          }
+
+          # Urutan pin yang diinginkan:
+          # 1. setup-wdown (di posisi atas)
+          # 2. Video
+          # 3. Download (MuMuSharedFolder)
+          # 4. twitter_media_harvest
+
+          Reset-QuickAccessPin -Path $wdownFolder   -Label "setup-wdown"
+          Reset-QuickAccessPin -Path $videoFolder   -Label "Video"
+          Reset-QuickAccessPin -Path $mumuDownload  -Label "Download (MuMuSharedFolder)"
+          Reset-QuickAccessPin -Path $twitterFolder -Label "twitter_media_harvest"
+
+          Write-Host "✅ Selesai membuat dan pin folder ke Quick Access."
+
+      - name: 🌐 Set network (ubah IP)
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: powershell -ExecutionPolicy Bypass -File "D:\setup-stream\ubah-ip.ps1"
+
+      - name: Register and Start VirtualBox VM
+        if: ${{ inputs.mode_restore == 'full' }}
+        shell: cmd
+        run: |
+          "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" registervm "D:\setup-stream\CasaOS\CasaOS.vbox"
+          "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" startvm "CasaOS" --type headless
+
+      - name: ⏳ Wait VM Ready (ping)
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          $ip = "192.168.56.1"
+          $maxTry = 60
+          $count = 0
+
+          Write-Host "Menunggu VM siap di $ip ..."
+
+          while ($count -lt $maxTry) {
+            if (Test-Connection -ComputerName $ip -Count 1 -Quiet) {
+            Write-Host "✅ VM sudah ready!"
+            exit 0
+          }
+
+          Start-Sleep -Seconds 1
+          $count++
+          }
+
+          Write-Host "❌ VM tidak merespon"
+          exit 1
+
+      - name: 🚀 Install & Run Bitvise
+        if: ${{ inputs.mode_restore == 'full' }}
+        run: |
+          Start-Process -FilePath "D:\setup-stream\BvSshClient-Inst.exe" -ArgumentList "-acceptEULA -installDir=`"C:\Program Files\Bitvise SSH Client`"" -Wait
+          Start-Sleep -Seconds 2
+          Start-Process "C:\Program Files\Bitvise SSH Client\BvSsh.exe" -ArgumentList "-host=192.168.56.1 -user=root -password=1 -openSftp=y -loginOnStartup"
+
+      - name: ⏳ Keep alive
+        run: |
+          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
+          if ($mins -lt 1) { $mins = 1 }
+
+          $end = (Get-Date).AddMinutes($mins)
+
+          while ((Get-Date) -lt $end) {
+            $left = [int][math]::Ceiling(($end - (Get-Date)).TotalMinutes)
+            Write-Host "CRD alive... ($left min left)"
+            Start-Sleep -Seconds 60
+          }
